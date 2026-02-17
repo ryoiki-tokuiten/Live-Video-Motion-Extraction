@@ -6,103 +6,35 @@
 import { render } from 'preact';
 import { useRef, useState, useEffect, useCallback } from 'preact/hooks';
 import { html } from 'htm/preact';
-
-// --- MORPHOLOGY HELPERS ---
-
-// Helper to get a pixel's brightness from a binary (black/white) image buffer.
-// Treats out-of-bounds pixels as black (0), which is standard for erosion.
-const getPixel = (data: Uint8ClampedArray, x: number, y: number, width: number, height: number): number => {
-  if (x < 0 || x >= width || y < 0 || y >= height) {
-    return 0;
-  }
-  // We only need one channel since it's a monochrome mask.
-  return data[(y * width + x) * 4];
-};
-
-// Helper to set a pixel's color in a binary image buffer.
-const setPixel = (data: Uint8ClampedArray, x: number, y: number, width: number, value: number) => {
-  const i = (y * width + x) * 4;
-  data[i] = data[i + 1] = data[i + 2] = value;
-  // Alpha is always opaque for the mask.
-  data[i + 3] = 255;
-};
-
-/**
- * Applies morphological operations (erosion, dilation) to a binary image mask.
- * 'open' (erode then dilate) is good for removing small noise.
- * 'close' (dilate then erode) is good for filling small holes.
- * @param data The image data to modify.
- * @param width The width of the image.
- * @param height The height of the image.
- * @param type The operation type: 'open' or 'close'.
- */
-const applyMorphology = (data: Uint8ClampedArray, width: number, height: number, type: 'open' | 'close') => {
-  const src = new Uint8ClampedArray(data); // Create a clean copy to read from
-  const buffer = new Uint8ClampedArray(data.length); // Intermediate buffer
-
-  const erode = (input: Uint8ClampedArray, output: Uint8ClampedArray) => {
-    for (let y = 0; y < height; y++) {
-      for (let x = 0; x < width; x++) {
-        let min = 255;
-        // Check the 3x3 neighborhood
-        for (let j = -1; j <= 1; j++) {
-          for (let i = -1; i <= 1; i++) {
-            min = Math.min(min, getPixel(input, x + i, y + j, width, height));
-          }
-        }
-        setPixel(output, x, y, width, min);
-      }
-    }
-  };
-
-  const dilate = (input: Uint8ClampedArray, output: Uint8ClampedArray) => {
-    for (let y = 0; y < height; y++) {
-      for (let x = 0; x < width; x++) {
-        let max = 0;
-        // Check the 3x3 neighborhood
-        for (let j = -1; j <= 1; j++) {
-          for (let i = -1; i <= 1; i++) {
-            max = Math.max(max, getPixel(input, x + i, y + j, width, height));
-          }
-        }
-        setPixel(output, x, y, width, max);
-      }
-    }
-  };
-
-  if (type === 'open') {
-    erode(src, buffer);
-    dilate(buffer, data); // Final result goes into the original `data` array
-  } else if (type === 'close') {
-    dilate(src, buffer);
-    erode(buffer, data); // Final result goes into the original `data` array
-  }
-};
-
+import { MotionEngine, MotionControls } from './gl/motion-engine';
 
 const App = () => {
   const [sourceUrl, setSourceUrl] = useState<string | null>(null);
   const [isWebcam, setIsWebcam] = useState(false);
   const [dimensions, setDimensions] = useState({ width: 640, height: 360 });
   const [isRecording, setIsRecording] = useState(false);
-  const [controls, setControls] = useState({
+  const [gpuInfo, setGpuInfo] = useState<string>('');
+
+  // Default controls
+  const [controls, setControls] = useState<MotionControls>({
     detectionMode: 'color', // 'color', 'luminance'
-    detectionThreshold: 15.0, // Swaps between 2.5 and 15.0
-    processingResolution: 0.25,
-    noiseReduction: 0, // Pre-blur
+    detectionThreshold: 15.0,
+    processingResolution: 1.0, // GPU can handle 100% easily
+    noiseReduction: 0,
     adaptationRate: 0.05,
     morphology: 'open', // 'none', 'open', 'close'
-    effect: 'classic', // 'classic', 'colorBurn', 'electricTrails'
+    effect: 'classic', // 'classic', 'colorBurn', 'electricTrails', 'heatmap', 'chromatic'
     invert: false,
-    persistence: 0.85, // For 'electricTrails' effect
+    persistence: 0.85,
   });
 
   const videoRef = useRef<HTMLVideoElement>(null);
+  // sourceCanvasRef is no longer strictly needed for processing, but good for visualization if we want to show raw input?
+  // Actually, let's keep it to show "Source" vs "Motion".
   const sourceCanvasRef = useRef<HTMLCanvasElement>(null);
   const motionCanvasRef = useRef<HTMLCanvasElement>(null);
-  const processingCanvasRef = useRef<HTMLCanvasElement>(null);
+  const engineRef = useRef<MotionEngine | null>(null);
   const animationFrameId = useRef<number>();
-  const backgroundModelData = useRef<{ mean: Float32Array; variance: Float32Array; } | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const recordedChunksRef = useRef<Blob[]>([]);
 
@@ -112,20 +44,20 @@ const App = () => {
       target.type === 'checkbox'
         ? target.checked
         : target.type === 'range'
-        ? Number(target.value)
-        : target.value;
-    
+          ? Number(target.value)
+          : target.value;
+
     const newControls = { ...controls, [target.id]: value };
 
     if (target.id === 'detectionMode') {
       if (value === 'color') {
-        newControls.detectionThreshold = 15.0; // Default for color
+        newControls.detectionThreshold = 15.0;
       } else {
-        newControls.detectionThreshold = 2.5; // Default for luminance
+        newControls.detectionThreshold = 2.5;
       }
     }
-    
-    setControls(newControls);
+
+    setControls(newControls as MotionControls);
   };
 
   const startWebcam = async () => {
@@ -136,11 +68,11 @@ const App = () => {
           .forEach((track) => track.stop());
       }
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: { width: { ideal: 1280 }, height: { ideal: 720 } },
+        video: { width: { ideal: 1920 }, height: { ideal: 1080 } }, // Request HD for GPU power!
       });
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
-        videoRef.current.src = ''; // Important to clear src
+        videoRef.current.src = '';
         setIsWebcam(true);
         setSourceUrl(null);
       }
@@ -168,11 +100,12 @@ const App = () => {
 
   const startRecording = () => {
     if (!motionCanvasRef.current) return;
-    if (isRecording || !motionCanvasRef.current) return;
+    if (isRecording) return;
 
-    const stream = motionCanvasRef.current.captureStream(30); // 30 FPS
+    const stream = motionCanvasRef.current.captureStream(60); // 60 FPS for GPU smoothness
     mediaRecorderRef.current = new MediaRecorder(stream, {
       mimeType: 'video/webm; codecs=vp9',
+      videoBitsPerSecond: 5000000 // High quality
     });
 
     recordedChunksRef.current = [];
@@ -190,7 +123,7 @@ const App = () => {
       document.body.appendChild(a);
       a.style.display = 'none';
       a.href = url;
-      a.download = 'motion-extract.webm';
+      a.download = 'motion-extract-gpu.webm';
       a.click();
       window.URL.revokeObjectURL(url);
       document.body.removeChild(a);
@@ -206,165 +139,90 @@ const App = () => {
     setIsRecording(false);
   };
 
+  // Initialize Engine
+  useEffect(() => {
+    if (motionCanvasRef.current && !engineRef.current) {
+      try {
+        engineRef.current = new MotionEngine(motionCanvasRef.current);
+        setGpuInfo(engineRef.current.getGPUInfo());
+        console.log("MotionEngine initialized (GPU)");
+      } catch (e) {
+        console.error("Failed to init MotionEngine:", e);
+        alert("WebGL 2 not supported! Browser too old?");
+      }
+    }
+  }, []);
+
   const draw = useCallback(() => {
     const video = videoRef.current;
     const sourceCanvas = sourceCanvasRef.current;
-    const motionCanvas = motionCanvasRef.current;
-    const processingCanvas = processingCanvasRef.current;
+    const engine = engineRef.current;
 
-    if (!video || !sourceCanvas || !motionCanvas || !processingCanvas || video.ended || video.readyState < 2) {
+    if (!video || !sourceCanvas || !engine || video.ended || video.readyState < 2) {
       animationFrameId.current = requestAnimationFrame(draw);
       return;
     }
 
+    // Draw source for visualization (optional, CPU bound but lightweight usually)
     const sourceCtx = sourceCanvas.getContext('2d');
-    const motionCtx = motionCanvas.getContext('2d');
-    const processingCtx = processingCanvas.getContext('2d', { willReadFrequently: true });
-    if (!sourceCtx || !motionCtx || !processingCtx) return;
-
-    const pWidth = Math.floor(dimensions.width * controls.processingResolution);
-    const pHeight = Math.floor(dimensions.height * controls.processingResolution);
-    if (processingCanvas.width !== pWidth) processingCanvas.width = pWidth;
-    if (processingCanvas.height !== pHeight) processingCanvas.height = pHeight;
-
-    if (controls.effect === 'electricTrails') {
-      motionCtx.fillStyle = `rgba(0, 0, 0, ${1 - controls.persistence})`;
-      motionCtx.fillRect(0, 0, dimensions.width, dimensions.height);
-    } else {
-      motionCtx.clearRect(0, 0, dimensions.width, dimensions.height);
+    if (sourceCtx) {
+      // Only draw if we want to see the source side-by-side
+      sourceCtx.drawImage(video, 0, 0, dimensions.width, dimensions.height);
     }
 
-    sourceCtx.drawImage(video, 0, 0, dimensions.width, dimensions.height);
-
-    processingCtx.filter = `blur(${controls.noiseReduction}px)`;
-    processingCtx.drawImage(video, 0, 0, pWidth, pHeight);
-
-    const currentFrame = processingCtx.getImageData(0, 0, pWidth, pHeight);
-    const currentData = currentFrame.data;
-
-    const motionFrame = processingCtx.createImageData(pWidth, pHeight);
-    const motionData = motionFrame.data;
-    
-    if (!backgroundModelData.current) {
-      const pSize = pWidth * pHeight;
-      const variance = new Float32Array(pSize);
-      const initialVariance = 100;
-      variance.fill(initialVariance);
-      
-      let mean;
-      if (controls.detectionMode === 'color') {
-        mean = new Float32Array(pSize * 3);
-        for (let i = 0, j = 0; i < currentData.length; i += 4, j++) {
-            mean[j * 3] = currentData[i];     // R
-            mean[j * 3 + 1] = currentData[i + 1]; // G
-            mean[j * 3 + 2] = currentData[i + 2]; // B
-        }
-      } else { // luminance
-        mean = new Float32Array(pSize);
-        for (let i = 0, j = 0; i < currentData.length; i += 4, j++) {
-            const brightness = (currentData[i] + currentData[i + 1] + currentData[i + 2]) / 3;
-            mean[j] = brightness;
-        }
-      }
-
-      backgroundModelData.current = { mean, variance };
-      animationFrameId.current = requestAnimationFrame(draw);
-      return;
-    }
-
-    const backgroundModel = backgroundModelData.current;
-    const meanData = backgroundModel.mean;
-    const varianceData = backgroundModel.variance;
-    
-    const alpha = controls.adaptationRate;
-    const thresholdMultiplier = controls.detectionThreshold;
-    const fg = controls.invert ? [0, 0, 0] : [255, 255, 255];
-    const bg = controls.invert ? [255, 255, 255] : [0, 0, 0];
-    const colorBurn = [3, 218, 198];
-    const minVariance = 25;
-
-    for (let i = 0, j = 0; i < currentData.length; i += 4, j++) {
-      let isForeground;
-      
-      const r = currentData[i];
-      const g = currentData[i + 1];
-      const b = currentData[i + 2];
-      const currentBrightness = (r + g + b) / 3;
-      const variance = varianceData[j];
-
-      if (controls.detectionMode === 'color') {
-        const meanR = meanData[j * 3];
-        const meanG = meanData[j * 3 + 1];
-        const meanB = meanData[j * 3 + 2];
-        const colorDist = Math.sqrt(Math.pow(r - meanR, 2) + Math.pow(g - meanG, 2) + Math.pow(b - meanB, 2));
-        isForeground = colorDist > thresholdMultiplier * Math.sqrt(Math.max(variance, minVariance));
-        
-        if (!isForeground) {
-          meanData[j * 3]     = (1 - alpha) * meanR + alpha * r;
-          meanData[j * 3 + 1] = (1 - alpha) * meanG + alpha * g;
-          meanData[j * 3 + 2] = (1 - alpha) * meanB + alpha * b;
-          const meanBrightness = (meanR + meanG + meanB) / 3;
-          const diff = currentBrightness - meanBrightness;
-          varianceData[j] = (1 - alpha) * variance + alpha * (diff * diff);
-        }
-      } else { // 'luminance' mode
-        const mean = meanData[j];
-        const diff = currentBrightness - mean;
-        isForeground = Math.abs(diff) > thresholdMultiplier * Math.sqrt(Math.max(variance, minVariance));
-        
-        if (!isForeground) {
-          meanData[j] = (1 - alpha) * mean + alpha * currentBrightness;
-          varianceData[j] = (1 - alpha) * variance + alpha * (diff * diff);
-        }
-      }
-      
-      if (isForeground) {
-        let color = fg;
-        if (controls.effect === 'colorBurn' && !controls.invert) {
-          color = colorBurn;
-        }
-        motionData[i] = color[0];
-        motionData[i + 1] = color[1];
-        motionData[i + 2] = color[2];
-        motionData[i + 3] = 255;
+    // Run GPU Engine
+    // Note: Engine handles its own context
+    try {
+      if (!engine['isInitialized']) { // Hacky check or public getter? 
+        // We called init in useEffect? No, we need to call init with dimensions.
+        // See playback init effect below.
       } else {
-        motionData[i] = bg[0];
-        motionData[i + 1] = bg[1];
-        motionData[i + 2] = bg[2];
-        motionData[i + 3] = controls.effect === 'electricTrails' ? 0 : 255;
+        engine.render(video, controls);
       }
+    } catch (e) {
+      console.error("Render error:", e);
     }
-
-    if (controls.morphology !== 'none') {
-      applyMorphology(motionData, pWidth, pHeight, controls.morphology as 'open' | 'close');
-    }
-
-    processingCtx.putImageData(motionFrame, 0, 0);
-    motionCtx.imageSmoothingEnabled = false;
-    motionCtx.drawImage(processingCanvas, 0, 0, dimensions.width, dimensions.height);
 
     animationFrameId.current = requestAnimationFrame(draw);
   }, [dimensions, controls]);
 
-  // Effect to manage video source lifecycle: loading, playing, and cleanup.
+  // Effect to manage video source lifecycle
   useEffect(() => {
     const video = videoRef.current;
+    const engine = engineRef.current;
+
     if (!video || (!sourceUrl && !isWebcam)) return;
 
-    if(sourceUrl) {
+    if (sourceUrl) {
       video.src = sourceUrl;
     }
+
+    // Cleanup previous listener
+    video.onloadedmetadata = null;
+    video.oncanplay = null;
 
     let hasInitialized = false;
     const initPlayback = () => {
       if (hasInitialized || !video) return;
       hasInitialized = true;
 
-      const newWidth = video.videoWidth || 640;
-      const newHeight = video.videoHeight || 360;
-      const aspectRatio = newWidth / newHeight;
+      const vWidth = video.videoWidth || 640;
+      const vHeight = video.videoHeight || 360;
+      const aspectRatio = vWidth / vHeight;
       const displayWidth = 640;
+      // Keep display size manageable for UI, but internal resolution can be higher
       setDimensions({ width: displayWidth, height: displayWidth / aspectRatio });
+
+      // Init Engine with VIDEO dimensions for max quality, or DISPLAY dimensions?
+      // For "insane speed", let's use full video resolution if possible, or a high capped one.
+      // Let's us the display dimensions for now to match canvas size.
+      // Or better: Use the video's native resolution for processing!
+      // But we need to fit in the canvas.
+      // Let's stick to dimensions state.
+
+      if (engine) {
+        engine.init(displayWidth, displayWidth / aspectRatio); // Init/Resize
+      }
 
       video.play().catch(e => {
         if (e.name !== 'AbortError') {
@@ -374,8 +232,8 @@ const App = () => {
     };
 
     video.onloadedmetadata = initPlayback;
-    video.oncanplay = initPlayback; // Robustness for webcam streams
-    if (video.readyState >= 2) initPlayback(); // HAVE_METADATA
+    video.oncanplay = initPlayback;
+    if (video.readyState >= 2) initPlayback();
 
     return () => {
       if (video) {
@@ -384,14 +242,22 @@ const App = () => {
       }
       if (sourceUrl) URL.revokeObjectURL(sourceUrl);
     };
-  }, [sourceUrl, isWebcam]);
+  }, [sourceUrl, isWebcam]); // engineRef is stable
 
-  // Effect to manage the rendering loop.
+  // Resize Engine if dimensions change
+  useEffect(() => {
+    if (engineRef.current && dimensions.width > 0) {
+      engineRef.current.resize(dimensions.width, dimensions.height);
+    }
+  }, [dimensions]);
+
+
+  // Rendering Loop
   useEffect(() => {
     if (animationFrameId.current) {
       cancelAnimationFrame(animationFrameId.current);
     }
-    
+
     if (sourceUrl || isWebcam) {
       animationFrameId.current = requestAnimationFrame(draw);
     }
@@ -403,21 +269,15 @@ const App = () => {
     };
   }, [draw, sourceUrl, isWebcam]);
 
-
-  // Effect to reset the background model when source or key params change.
-  useEffect(() => {
-    backgroundModelData.current = null;
-  }, [controls.processingResolution, controls.detectionMode, sourceUrl, isWebcam]);
-
   return html`
     <div class="sidebar">
-      <div class="sidebar-header">Controls</div>
+      <div class="sidebar-header">GPU Controls</div>
       <fieldset>
         <legend>Source</legend>
         <div class="button-group">
           <label for="video-upload" class="btn">Upload Video</label>
           <input id="video-upload" type="file" accept="video/*" onChange=${handleFileUpload} />
-          <button class="btn secondary" onClick=${startWebcam}>Use Webcam</button>
+          <button class="btn secondary" onClick=${startWebcam}>Use Webcam (HD)</button>
         </div>
       </fieldset>
 
@@ -427,7 +287,7 @@ const App = () => {
             <label for="detectionMode">Detection Mode</label>
             <select id="detectionMode" value=${controls.detectionMode} onChange=${handleControlChange}>
                 <option value="color">Color (Robust)</option>
-                <option value="luminance">Luminance (Classic)</option>
+                <option value="luminance">Luminance (Fast)</option>
             </select>
         </div>
       </fieldset>
@@ -436,13 +296,13 @@ const App = () => {
         <legend>Detection</legend>
         <div class="control-group">
           <label for="detectionThreshold">
-            ${controls.detectionMode === 'color' ? 'Color Threshold' : 'Luminance Threshold'}: ${controls.detectionThreshold.toFixed(1)}
+            Threshold: ${controls.detectionThreshold.toFixed(1)}
           </label>
           <input 
             id="detectionThreshold" 
             type="range" 
             min="1.0" 
-            max=${controls.detectionMode === 'color' ? 50.0 : 10.0} 
+            max="50.0"
             step="0.1" 
             value=${controls.detectionThreshold} 
             onInput=${handleControlChange} />
@@ -451,16 +311,9 @@ const App = () => {
           <label for="adaptationRate">Adaptation Speed: ${Math.round(controls.adaptationRate * 1000)}</label>
           <input id="adaptationRate" type="range" min="0.001" max="0.5" step="0.001" value=${controls.adaptationRate} onInput=${handleControlChange} />
         </div>
+        <!-- Resolution is now typically fixed to canvas size for GPU, but we could add scaling if needed. Removed for simplicity as GPU is fast. -->
         <div class="control-group">
-          <label for="processingResolution">Resolution: ${Math.round(controls.processingResolution * 100)}%</label>
-          <input id="processingResolution" type="range" min="0.1" max="1" step="0.05" value=${controls.processingResolution} onInput=${handleControlChange} />
-        </div>
-         <div class="control-group">
-          <label for="noiseReduction">Pre-blur: ${controls.noiseReduction}px</label>
-          <input id="noiseReduction" type="range" min="0" max="5" step="0.5" value=${controls.noiseReduction} onInput=${handleControlChange} />
-        </div>
-        <div class="control-group">
-          <label for="morphology">Cleanup Filter</label>
+          <label for="morphology">Cleanup Filter (GPU)</label>
           <select id="morphology" value=${controls.morphology} onChange=${handleControlChange}>
             <option value="none">None</option>
             <option value="open">Clean Noise</option>
@@ -477,14 +330,10 @@ const App = () => {
             <option value="classic">Classic</option>
             <option value="colorBurn">Color Burn</option>
             <option value="electricTrails">Electric Trails</option>
+            <option value="heatmap">Motion Heatmap</option>
+            <option value="chromatic">Chromatic Aberration</option>
           </select>
         </div>
-        ${controls.effect === 'electricTrails' && html`
-          <div class="control-group">
-            <label for="persistence">Trail Length: ${Math.round(controls.persistence * 100)}%</label>
-            <input id="persistence" type="range" min="0" max="0.99" step="0.01" value=${controls.persistence} onInput=${handleControlChange} />
-          </div>
-        `}
         <div class="toggle-switch">
           <span class="toggle-label">Invert Colors</span>
           <label class="switch">
@@ -505,8 +354,9 @@ const App = () => {
     <main>
       ${!sourceUrl && !isWebcam && html`
         <div class="message">
-          <h1>Welcome to the Advanced Motion Extractor</h1>
-          <p>Upload a video file or activate your webcam to begin. Use the controls on the left to configure the detection and apply visual effects in real-time.</p>
+          <h1>GPU Motion Extractor</h1>
+          <p>Powered by WebGL 2.0. Upload a video or use webcam to see "Insane Speed".</p>
+          <p style="font-size: 0.8em; opacity: 0.7; margin-top: 10px;">Hardware: ${gpuInfo}</p>
         </div>
       `}
       <div class="canvas-container" style=${{ display: sourceUrl || isWebcam ? 'flex' : 'none' }}>
@@ -515,14 +365,13 @@ const App = () => {
           <canvas ref=${sourceCanvasRef} width=${dimensions.width} height=${dimensions.height}></canvas>
         </div>
         <div class="canvas-wrapper">
-          <h2>Motion</h2>
+          <h2>Motion (GL)</h2>
           <canvas ref=${motionCanvasRef} width=${dimensions.width} height=${dimensions.height}></canvas>
         </div>
       </div>
     </main>
 
     <video ref=${videoRef} class="hidden" loop muted playsinline></video>
-    <canvas ref=${processingCanvasRef} class="hidden"></canvas>
   `;
 };
 
